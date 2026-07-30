@@ -193,6 +193,63 @@ def generate_unique_email(db, base_prefix):
         counter += 1
     return email
 
+def get_guru_ketersediaan(db, tanggal, jam_mulai_str, jam_selesai_str, current_guru_id):
+    HARI_ID = {0:'Senin', 1:'Selasa', 2:'Rabu', 3:'Kamis', 4:'Jumat', 5:'Sabtu', 6:'Minggu'}
+    hari_name = HARI_ID[tanggal.weekday()]
+    
+    gurus = db.query(Guru).order_by(Guru.nama).all()
+    status_list = []
+    
+    for g in gurus:
+        if current_guru_id and g.id == current_guru_id:
+            continue
+            
+        # 1. Cek bentrok jadwal mengajar
+        jadwal_bentrok = db.query(Jadwal).filter(
+            Jadwal.guru_id == g.id,
+            Jadwal.hari == hari_name,
+            Jadwal.jam_mulai < jam_selesai_str,
+            Jadwal.jam_selesai > jam_mulai_str
+        ).first()
+        
+        # 2. Cek guru sedang izin sendiri
+        izin_sendiri = db.query(Izin).filter(
+            Izin.guru_id == g.id,
+            Izin.tanggal == tanggal,
+            Izin.status.in_(['PENDING_PENGGANTI', 'PENDING_WAKASEK', 'PENDING_KEPSEK', 'APPROVED'])
+        ).first()
+        
+        # 3. Cek guru sudah jadi pengganti di izin lain
+        izin_pengganti = db.query(Izin).filter(
+            Izin.guru_pengganti_id == g.id,
+            Izin.tanggal == tanggal,
+            Izin.status.in_(['PENDING_PENGGANTI', 'PENDING_WAKASEK', 'PENDING_KEPSEK', 'APPROVED'])
+        ).first()
+        
+        tersedia = not jadwal_bentrok and not izin_sendiri and not izin_pengganti
+        keterangan = "🟢 Kosong / Tersedia"
+        
+        if jadwal_bentrok:
+            mapel = db.query(MataPelajaran).get(jadwal_bentrok.mapel_id)
+            kelas = db.query(Kelas).get(jadwal_bentrok.kelas_id)
+            mapel_name = mapel.nama_mapel if mapel else "KBM"
+            kelas_name = kelas.nama_kelas if kelas else ""
+            keterangan = f"🔴 Mengajar {mapel_name} {kelas_name} ({jadwal_bentrok.jam_mulai}-{jadwal_bentrok.jam_selesai})"
+        elif izin_sendiri:
+            keterangan = f"🔴 Sedang Izin ({izin_sendiri.jenis_izin})"
+        elif izin_pengganti:
+            keterangan = f"🟡 Bertugas sbg Pengganti Guru Lain"
+            
+        status_list.append({
+            "id": g.id,
+            "nama": g.nama,
+            "nip": g.nip,
+            "tersedia": tersedia,
+            "keterangan": keterangan
+        })
+        
+    return status_list
+
 def process_excel_dataframe(df_dict, db):
     added_count = 0
     for sheet_name, df in df_dict.items():
@@ -485,7 +542,7 @@ if menu == "📊 Dashboard":
     db.close()
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PAGE 2: AJUKAN IZIN BARU
+# PAGE 2: AJUKAN IZIN BARU (WITH AUTOMATIC GURU KOSONG DETECTION)
 # ══════════════════════════════════════════════════════════════════════════════
 elif menu == "📝 Ajukan Izin Baru":
     st.write("### 📝 Form Pengajuan Izin Guru")
@@ -494,21 +551,36 @@ elif menu == "📝 Ajukan Izin Baru":
         st.warning("Akun Anda tidak terhubung dengan profil Guru. Login sebagai Guru untuk mengajukan izin.")
     else:
         db = get_db()
-        all_guru = db.query(Guru).filter(Guru.id != curr_user['guru_id']).order_by(Guru.nama).all()
-        guru_map = {g.nama: g.id for g in all_guru}
         
-        with st.form("form_izin"):
-            col_a, col_b = st.columns(2)
-            with col_a:
-                tanggal = st.date_input("Tanggal Izin:", datetime.date.today())
-                jenis_izin = st.selectbox("Jenis Izin:", ["Sakit", "Cuti Nifas / Melahirkan", "Dinas Luar", "Urusan Keluarga", "Izin Terlambat / Pulang Awal", "Lainnya"])
-                guru_pengganti_nama = st.selectbox("Pilih Guru Pengganti:", ["-- Tidak Perlu Guru Pengganti --"] + list(guru_map.keys()))
+        col_a, col_b = st.columns(2)
+        with col_a:
+            tanggal = st.date_input("Tanggal Izin:", datetime.date.today())
+            jenis_izin = st.selectbox("Jenis Izin:", ["Sakit", "Cuti Nifas / Melahirkan", "Dinas Luar", "Urusan Keluarga", "Izin Terlambat / Pulang Awal", "Lainnya"])
+        with col_b:
+            jam_mulai = st.time_input("Jam Mulai:", datetime.time(7, 0))
+            jam_selesai = st.time_input("Jam Selesai:", datetime.time(13, 0))
             
-            with col_b:
-                jam_mulai = st.time_input("Jam Mulai:", datetime.time(7, 0))
-                jam_selesai = st.time_input("Jam Selesai:", datetime.time(13, 0))
-                alasan = st.text_area("Alasan Izin (Jelas & Detil):", placeholder="Contoh: Mengikuti pelatihan Dinas Pendidikan di Kabupaten Kendal")
+        # ⚡ AUTOMATIC DETECT GURU KOSONG / TERSEDIA
+        status_ketersediaan = get_guru_ketersediaan(db, tanggal, jam_mulai.strftime('%H:%M'), jam_selesai.strftime('%H:%M'), curr_user['guru_id'])
+        
+        guru_options_map = {"-- Tidak Perlu Guru Pengganti --": None}
+        free_gurus = []
+        
+        for g_stat in status_ketersediaan:
+            label = f"{g_stat['keterangan']} | {g_stat['nama']}"
+            guru_options_map[label] = g_stat['id']
+            if g_stat['tersedia']:
+                free_gurus.append(g_stat['nama'])
                 
+        st.markdown("#### 💡 Deteksi Guru Kosong / Jam Kosong Otomatis")
+        if free_gurus:
+            st.success(f"**{len(free_gurus)} Guru Kosong (Tersedia)** pada {tanggal.strftime('%d-%m-%Y')} jam {jam_mulai.strftime('%H:%M')}-{jam_selesai.strftime('%H:%M')}:\n\n" + ", ".join(free_gurus[:8]) + ("..." if len(free_gurus)>8 else ""))
+        else:
+            st.info("Seluruh guru memiliki jadwal mengajar / bertugas pada jam ini.")
+
+        with st.form("form_izin"):
+            guru_pengganti_label = st.selectbox("Pilih Guru Pengganti (Lihat Tag Status Ketersediaan):", list(guru_options_map.keys()))
+            alasan = st.text_area("Alasan Izin (Jelas & Detil):", placeholder="Contoh: Mengikuti pelatihan Dinas Pendidikan di Kabupaten Kendal")
             uploaded_file = st.file_uploader("Lampiran (Surat Dokter / Surat Tugas - Optional):", type=["pdf", "jpg", "png"])
             
             submitted = st.form_submit_button("🚀 Kirim Pengajuan Izin", type="primary", use_container_width=True)
@@ -517,7 +589,7 @@ elif menu == "📝 Ajukan Izin Baru":
                 if not alasan:
                     st.error("Alasan izin wajib diisi!")
                 else:
-                    pengganti_id = guru_map.get(guru_pengganti_nama)
+                    pengganti_id = guru_options_map.get(guru_pengganti_label)
                     status_awal = "PENDING_PENGGANTI" if pengganti_id else "PENDING_WAKASEK"
                     
                     filename = None
