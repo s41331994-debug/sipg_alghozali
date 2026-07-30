@@ -148,7 +148,7 @@ class Notifikasi(Base):
 Base.metadata.create_all(bind=engine)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# HELPER FUNCTIONS & SEEDING
+# HELPER FUNCTIONS & SEEDING (YPI AL GHOZALI EXCEL & PDF)
 # ══════════════════════════════════════════════════════════════════════════════
 def get_db():
     return SessionLocal()
@@ -173,35 +173,43 @@ def init_seed():
         guru_count = db.query(Guru).count()
         if guru_count == 0:
             excel_filename = "DATA GURU DAN TENAGA KEPENDIDIKAN - YPI AL GHOZALI - TA 2026-2027.xlsx"
-            excel_path = os.path.join(os.path.dirname(__file__), excel_filename)
-            if os.path.exists(excel_path):
-                df = pd.read_excel(excel_path)
-                nama_col = [c for c in df.columns if 'nama' in str(c).lower()]
-                nama_col = nama_col[0] if nama_col else df.columns[1]
-                
-                for idx, row in df.iterrows():
-                    nama = str(row[nama_col]).strip() if not pd.isna(row[nama_col]) else ""
-                    if len(nama) < 3 or 'nama' in nama.lower():
-                        continue
+            possible_paths = [
+                os.path.join(os.path.dirname(__file__), excel_filename),
+                os.path.join(os.path.dirname(os.path.dirname(__file__)), excel_filename),
+                os.path.join(os.getcwd(), excel_filename)
+            ]
+            
+            excel_path = next((p for p in possible_paths if os.path.exists(p)), None)
+            
+            if excel_path:
+                xl = pd.ExcelFile(excel_path)
+                for sheet in xl.sheet_names:
+                    df = pd.read_excel(excel_path, sheet_name=sheet)
+                    nama_col = [c for c in df.columns if 'nama' in str(c).lower()]
+                    nama_col = nama_col[0] if nama_col else (df.columns[1] if len(df.columns) > 1 else None)
+                    nip_col = [c for c in df.columns if any(k in str(c).lower() for k in ['nip', 'nik', 'nuptk'])]
+                    nip_col = nip_col[0] if nip_col else None
                     
-                    email = f"guru{idx}@sipg.com"
-                    pw_g = bcrypt.hashpw(b"password123", bcrypt.gensalt()).decode('utf-8')
-                    u = User(email=email, password=pw_g, role='Guru')
-                    db.add(u)
-                    db.flush()
-                    
-                    g = Guru(user_id=u.id, nip=f"1980{idx:04d}", nama=nama, no_hp="08123456789")
-                    db.add(g)
-                db.commit()
-            else:
-                # Fallback dummy teachers if Excel file is not present
-                dummy_gurus = ["Drs. H. Ahmad Dahlan", "Siti Rahmawati, S.Pd", "Budi Santoso, M.Pd", "Eka Putri, S.Si"]
-                for idx, nama in enumerate(dummy_gurus):
-                    pw_g = bcrypt.hashpw(b"password123", bcrypt.gensalt()).decode('utf-8')
-                    u = User(email=f"guru{idx}@sipg.com", password=pw_g, role='Guru')
-                    db.add(u)
-                    db.flush()
-                    db.add(Guru(user_id=u.id, nip=f"198500{idx}", nama=nama, no_hp="08123456789"))
+                    if nama_col:
+                        for idx, row in df.iterrows():
+                            nama = str(row[nama_col]).strip() if not pd.isna(row[nama_col]) else ""
+                            if len(nama) < 3 or any(k in nama.lower() for k in ['nama', 'daftar', 'rekap', 'kependidikan', 'no.']):
+                                continue
+                            
+                            # Check duplicate by name
+                            if db.query(Guru).filter_by(nama=nama).first():
+                                continue
+                            
+                            nip_val = str(row[nip_col]).strip() if nip_col and not pd.isna(row[nip_col]) else f"1985{idx:04d}"
+                            
+                            email = f"guru{db.query(Guru).count() + 1}@sipg.com"
+                            pw_g = bcrypt.hashpw(b"password123", bcrypt.gensalt()).decode('utf-8')
+                            u = User(email=email, password=pw_g, role='Guru')
+                            db.add(u)
+                            db.flush()
+                            
+                            g = Guru(user_id=u.id, nip=nip_val, nama=nama, no_hp="08123456789")
+                            db.add(g)
                 db.commit()
     except Exception as e:
         db.rollback()
