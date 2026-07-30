@@ -153,6 +153,75 @@ Base.metadata.create_all(bind=engine)
 def get_db():
     return SessionLocal()
 
+def load_excel_teachers(db):
+    excel_filename = "DATA GURU DAN TENAGA KEPENDIDIKAN - YPI AL GHOZALI - TA 2026-2027.xlsx"
+    possible_paths = [
+        os.path.join(os.path.dirname(__file__), excel_filename),
+        os.path.join(os.path.dirname(os.path.dirname(__file__)), excel_filename),
+        os.path.join(os.getcwd(), excel_filename)
+    ]
+    excel_path = next((p for p in possible_paths if os.path.exists(p)), None)
+    
+    if not excel_path:
+        return False, f"File Excel '{excel_filename}' tidak ditemukan di folder aplikasi."
+
+    try:
+        xl = pd.ExcelFile(excel_path)
+        added_count = 0
+        
+        for sheet_name in xl.sheet_names:
+            df = pd.read_excel(excel_path, sheet_name=sheet_name)
+            
+            nama_col = None
+            nip_col = None
+            
+            for col in df.columns:
+                col_lower = str(col).lower()
+                if 'nama' in col_lower and not nama_col:
+                    nama_col = col
+                if any(k in col_lower for k in ['nip', 'nik', 'nuptk']) and not nip_col:
+                    nip_col = col
+            
+            if not nama_col:
+                for row_idx, row in df.iterrows():
+                    row_strs = [str(v).lower() for v in row.values]
+                    if any('nama' in s for s in row_strs):
+                        for col_idx, s in enumerate(row_strs):
+                            if 'nama' in s:
+                                nama_col = df.columns[col_idx]
+                                break
+                        break
+            
+            if not nama_col and len(df.columns) > 1:
+                nama_col = df.columns[1]
+                
+            if nama_col:
+                for idx, row in df.iterrows():
+                    val = str(row[nama_col]).strip() if not pd.isna(row[nama_col]) else ""
+                    if len(val) < 3 or any(k in val.lower() for k in ['nama', 'daftar', 'rekap', 'kependidikan', 'no.', 'tahun', 'pelajaran', 'ypi', 'al ghozali']):
+                        continue
+                    
+                    # Check if already exists
+                    existing = db.query(Guru).filter_by(nama=val).first()
+                    if not existing:
+                        nip_val = str(row[nip_col]).strip() if nip_col and not pd.isna(row[nip_col]) else f"1985{idx:04d}"
+                        
+                        email = f"guru{db.query(Guru).count() + 1}@sipg.com"
+                        pw_g = bcrypt.hashpw(b"password123", bcrypt.gensalt()).decode('utf-8')
+                        u = User(email=email, password=pw_g, role='Guru')
+                        db.add(u)
+                        db.flush()
+                        
+                        g = Guru(user_id=u.id, nip=nip_val, nama=val, no_hp="08123456789")
+                        db.add(g)
+                        added_count += 1
+                        
+        db.commit()
+        return True, f"Berhasil memuat data guru dari Excel ({added_count} guru baru ditambahkan)."
+    except Exception as e:
+        db.rollback()
+        return False, f"Error membaca Excel: {str(e)}"
+
 def init_seed():
     db = get_db()
     try:
@@ -169,48 +238,19 @@ def init_seed():
             db.add(User(email='kepsek@sipg.com', password=pw_k, role='Kepala Sekolah'))
             db.commit()
 
-        # Seed Guru from Excel if empty
-        guru_count = db.query(Guru).count()
-        if guru_count == 0:
-            excel_filename = "DATA GURU DAN TENAGA KEPENDIDIKAN - YPI AL GHOZALI - TA 2026-2027.xlsx"
-            possible_paths = [
-                os.path.join(os.path.dirname(__file__), excel_filename),
-                os.path.join(os.path.dirname(os.path.dirname(__file__)), excel_filename),
-                os.path.join(os.getcwd(), excel_filename)
-            ]
-            
-            excel_path = next((p for p in possible_paths if os.path.exists(p)), None)
-            
-            if excel_path:
-                xl = pd.ExcelFile(excel_path)
-                for sheet in xl.sheet_names:
-                    df = pd.read_excel(excel_path, sheet_name=sheet)
-                    nama_col = [c for c in df.columns if 'nama' in str(c).lower()]
-                    nama_col = nama_col[0] if nama_col else (df.columns[1] if len(df.columns) > 1 else None)
-                    nip_col = [c for c in df.columns if any(k in str(c).lower() for k in ['nip', 'nik', 'nuptk'])]
-                    nip_col = nip_col[0] if nip_col else None
-                    
-                    if nama_col:
-                        for idx, row in df.iterrows():
-                            nama = str(row[nama_col]).strip() if not pd.isna(row[nama_col]) else ""
-                            if len(nama) < 3 or any(k in nama.lower() for k in ['nama', 'daftar', 'rekap', 'kependidikan', 'no.']):
-                                continue
-                            
-                            # Check duplicate by name
-                            if db.query(Guru).filter_by(nama=nama).first():
-                                continue
-                            
-                            nip_val = str(row[nip_col]).strip() if nip_col and not pd.isna(row[nip_col]) else f"1985{idx:04d}"
-                            
-                            email = f"guru{db.query(Guru).count() + 1}@sipg.com"
-                            pw_g = bcrypt.hashpw(b"password123", bcrypt.gensalt()).decode('utf-8')
-                            u = User(email=email, password=pw_g, role='Guru')
-                            db.add(u)
-                            db.flush()
-                            
-                            g = Guru(user_id=u.id, nip=nip_val, nama=nama, no_hp="08123456789")
-                            db.add(g)
-                db.commit()
+        # Always attempt to auto-load Excel teachers
+        load_excel_teachers(db)
+        
+        # Fallback if empty
+        if db.query(Guru).count() == 0:
+            dummy_gurus = ["Drs. H. Ahmad Dahlan", "Siti Rahmawati, S.Pd", "Budi Santoso, M.Pd", "Eka Putri, S.Si"]
+            for idx, nama in enumerate(dummy_gurus):
+                pw_g = bcrypt.hashpw(b"password123", bcrypt.gensalt()).decode('utf-8')
+                u = User(email=f"guru{idx}@sipg.com", password=pw_g, role='Guru')
+                db.add(u)
+                db.flush()
+                db.add(Guru(user_id=u.id, nip=f"198500{idx}", nama=nama, no_hp="08123456789"))
+            db.commit()
     except Exception as e:
         db.rollback()
     finally:
@@ -522,8 +562,18 @@ elif menu == "📋 Daftar Izin & Approval":
 elif menu == "👥 Data Guru":
     st.write("### 👥 Daftar Guru & Tenaga Kependidikan YPI Al Ghozali")
     db = get_db()
-    gurus = db.query(Guru).order_by(Guru.nama).all()
     
+    col_x, col_y = st.columns([3, 1])
+    with col_y:
+        if st.button("🔄 Impor / Reset Excel Data Guru", type="secondary", use_container_width=True):
+            success, msg = load_excel_teachers(db)
+            if success:
+                st.success(msg)
+                st.rerun()
+            else:
+                st.error(msg)
+                
+    gurus = db.query(Guru).order_by(Guru.nama).all()
     guru_data = [{"ID": g.id, "NIP / NIK": g.nip or "—", "Nama Lengkap": g.nama, "No. HP": g.no_hp or "—"} for g in gurus]
     st.dataframe(pd.DataFrame(guru_data), use_container_width=True)
     db.close()
